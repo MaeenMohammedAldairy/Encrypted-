@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <title>POC مشفّر ومؤمّن (HTTPS + Signed Keys + SQLite)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: sans-serif; max-width:980px; margin:20px auto; line-height:1.5; direction: rtl; }
+    .box { border:1px solid #ddd; padding:12px; border-radius:6px; margin-top:10px; }
+    input, button, textarea { width:100%; padding:8px; margin-top:6px; box-sizing:border-box; }
+    textarea { height:80px; }
+    pre { background:#f7f7f7; padding:10px; white-space:pre-wrap; }
+    .small { font-size:0.9em; color:#666; }
+  </style>
+</head>
+<body>
+  <h1>POC متقدّم — HTTPS + مفاتيح موقّعة + SQLite</h1>
+
+  <div class="box">
+    <label>خادم API (عادة https://localhost:3443):</label>
+    <input id="serverUrl" value="https://localhost:3443" />
+    <h3>المستخدم</h3>
+    <label>معرّف المستخدم (userId):</label>
+    <input id="userId" placeholder="مثال: alice" />
+    <label>كلمة المرور (>=12 حروف):</label>
+    <input id="password" type="password" />
+    <button id="registerBtn">تسجيل</button>
+    <button id="loginBtn">تسجيل دخول</button>
+    <div id="authStatus" class="small"></div>
+    <button id="logoutBtn" style="display:none">تسجيل خروج</button>
+  </div>
+
+  <div class="box">
+    <label>توليد وتسجيل المفتاح العام (موقّع من الخادم):</label>
+    <button id="genKeyBtn">توليد زوج مفاتيح RSA (متصفح)</button>
+    <button id="registerKeyBtn">تسجيل المفتاح العام عند الخادم (مؤمّن)</button>
+    <div id="status" style="color:green;margin-top:8px"></div>
+    <label>تصدير المفتاح الخاص (مشفّر بكلمة سر):</label>
+    <input id="exportPassword" type="password" placeholder="كلمة سر لحماية الملف (اختياري)" />
+    <button id="exportBtn">تصدير المفتاح الخاص إلى ملف مشفّر</button>
+    <label>استيراد المفتاح الخاص (ملف مشفّر):</label>
+    <input id="importFile" type="file" accept=".bin" />
+    <input id="importPassword" type="password" placeholder="كلمة السر المستخدمة للتصدير (إن وُجدت)" />
+    <button id="importBtn">استيراد المفتاح الخاص من الملف</button>
+    
+  </div>
+
+  <div class="box">
+    <label>إرسال رسالة إلى (recipientId):</label>
+    <input id="recipientId" placeholder="مثال: bob" />
+    <label>نص الرسالة:</label>
+    <textarea id="plaintext">مرحبا، هذه رسالة مشفّرة هجيناً.</textarea>
+    <button id="sendBtn">إرسال مشفّر</button>
+  </div>
+
+  <div class="box">
+    <button id="fetchBtn">جلب الرسائل الواردة وفك التشفير</button>
+    <div id="inbox"></div>
+  </div>
+
+  <h3>سجل (Console)</h3>
+  <pre id="log"></pre>
+
+<script>
+/* Helpers */
+const logEl = document.getElementById('log');
+function log(...args){ logEl.textContent += args.map(a => typeof a === 'object' ? JSON.stringify(a,null,2) : String(a)).join(' ') + '\\n'; logEl.scrollTop = logEl.scrollHeight; }
+function str2ab(str){ return new TextEncoder().encode(str); }
+function ab2str(buf){ return new TextDecoder().decode(buf); }
+function ab2b64(buf){ const bytes = new Uint8Array(buf); let binary=''; for(let i=0;i<bytes.byteLength;i++) binary+=String.fromCharCode(bytes[i]); return btoa(binary); }
+function b642ab(b64){ const binary = atob(b64); const bytes=new Uint8Array(binary.length); for(let i=0;i<binary.length;i++) bytes[i]=binary.charCodeAt(i); return bytes.buffer; }
+
+let myKeyPair = null;
+let myExportedPublicJwk = null;
+const serverUrlInput = document.getElementById('serverUrl');
+async function fetchServerPublicPem(){
+  const url = serverUrlInput.value + '/server-public.pem';
+  const resp = await fetch(url);
+  if(!resp.ok) throw new Error('failed to fetch server public pem');
+  return await resp.text();
+}
+function pemToArrayBuffer(pem){
+  const b64 = pem.replace(/-----BEGIN PUBLIC KEY-----/,'').replace(/-----END PUBLIC KEY-----/,'').replace(/\s+/g,'');
+  const binary = atob(b64);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for(let i=0;i<len;i++) bytes[i]=binary.charCodeAt(i);
+  return bytes.buffer;
+}
+async function importServerPublicKeyForVerify(pem){
+  const ab = pemToArrayBuffer(pem);
+  return await window.crypto.subtle.importKey('spki', ab, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+}
+
+// Auth
+function getToken(){ return localStorage.getItem('poc_token'); }
+function setToken(t){ if(t){ localStorage.setItem('poc_token', t); document.getElementById('logoutBtn').style.display='inline-block'; } else { localStorage.removeItem('poc_token'); document.getElementById('logoutBtn').style.display='none'; } }
+function authHeaders(){ const t=getToken(); return t ? { 'Authorization': 'Bearer ' + t } : {}; }
+function updateAuthUI(){ const t=getToken(); const s=document.getElementById('authStatus'); if(t){ s.textContent='مسجّل دخول'; document.getElementById('logoutBtn').style.display='inline-block'; } else { s.textContent='غير مسجّل'; document.getElementById('logoutBtn').style.display='none'; } }
+updateAuthUI();
+
+async function registerUser(){
+  const userId=document.getElementById('userId').value.trim();
+  const password=document.getElementById('password').value;
+  if(!userId||!password) return alert('ادخل userId و password');
+  const resp = await fetch(serverUrlInput.value + '/auth/register', { method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ userId, password }) });
+  const j = await resp.json(); log('register:', j); if(j.ok) alert('تم التسجيل. سجّل الدخول الآن.');
+}
+async function loginUser(){
+  const userId=document.getElementById('userId').value.trim();
+  const password=document.getElementById('password').value;
+  if(!userId||!password) return alert('ادخل userId و password');
+  const resp = await fetch(serverUrlInput.value + '/auth/login', { method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ userId, password }) });
+  const j = await resp.json(); log('login:', j); if(j.token){ setToken(j.token); updateAuthUI(); alert('تم تسجيل الدخول.'); } else alert('فشل: '+JSON.stringify(j));
+}
+document.getElementById('registerBtn').addEventListener('click', registerUser);
+document.getElementById('loginBtn').addEventListener('click', loginUser);
+document.getElementById('logoutBtn').addEventListener('click', ()=>{ setToken(null); updateAuthUI(); alert('تم تسجيل الخروج.'); });
+
+// Keygen & register
+document.getElementById('genKeyBtn').addEventListener('click', async ()=>{
+  myKeyPair = await window.crypto.subtle.generateKey({ name:'RSA-OAEP', modulusLength:2048, publicExponent:new Uint8Array([1,0,1]), hash:'SHA-256' }, true, ['encrypt','decrypt']);
+  myExportedPublicJwk = await window.crypto.subtle.exportKey('jwk', myKeyPair.publicKey);
+  log('generated public JWK:', myExportedPublicJwk);
+  document.getElementById('status').textContent='تم توليد زوج مفاتيح.';
+});
+
+async function registerPublicKey(){
+  const userId=document.getElementById('userId').value.trim();
+  if(!userId) return alert('ادخل userId');
+  if(!myExportedPublicJwk) return alert('لم تولّد المفتاح بعد.');
+  const resp = await fetch(serverUrlInput.value + '/register-key', { method:'POST', headers: Object.assign({'Content-Type':'application/json'}, authHeaders()), body: JSON.stringify({ userId, publicKeyJwk: myExportedPublicJwk }) });
+  const j = await resp.json(); log('registerKey:', j); if(j.ok) alert('تم تسجيل المفتاح، التوقيع: '+(j.signatureB64||''));
+}
+document.getElementById('registerKeyBtn').addEventListener('click', registerPublicKey);
+
+// Fetch public key and verify signature with server public key
+async function fetchPublicJwkAndVerify(userId){
+  const resp = await fetch(serverUrlInput.value + '/get-key/' + encodeURIComponent(userId), { headers: authHeaders() });
+  if(!resp.ok) { const t = await resp.text(); throw new Error('get-key failed: ' + t); }
+  const j = await resp.json();
+  const serverPem = await fetchServerPublicPem();
+  const verifier = await importServerPublicKeyForVerify(serverPem);
+  const payload = JSON.stringify(j.publicKeyJwk);
+  const enc = new TextEncoder().encode(payload);
+  const sig = b64ToUint8(j.signatureB64);
+  const ok = await window.crypto.subtle.verify('RSASSA-PKCS1-v1_5', verifier, sig, enc);
+  if(!ok) throw new Error('signature verification failed');
+  return j.publicKeyJwk;
+}
+function b64ToUint8(b64){ const bin = atob(b64); const arr = new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i); return arr; }
+
+// Hybrid encryption and send (uses server verification when fetching recipient key)
+async function fetchPublicJwk(userId){
+  return await fetchPublicJwkAndVerify(userId);
+}
+async function generateAesKey(){ return await window.crypto.subtle.generateKey({ name:'AES-GCM', length:256 }, true, ['encrypt','decrypt']); }
+async function aesEncrypt(aesKey, plaintext){ const iv = window.crypto.getRandomValues(new Uint8Array(12)); const ct = await window.crypto.subtle.encrypt({ name:'AES-GCM', iv }, aesKey, str2ab(plaintext)); return { ivB64: ab2b64(iv.buffer), ciphertextB64: ab2b64(ct) }; }
+async function encryptAesKeyWithRsa(recipientJwk, aesKeyRawAB){ const pubKey = await window.crypto.subtle.importKey('jwk', recipientJwk, { name:'RSA-OAEP', hash:'SHA-256' }, false, ['encrypt']); const enc = await window.crypto.subtle.encrypt({ name:'RSA-OAEP' }, pubKey, aesKeyRawAB); return ab2b64(enc); }
+
+async function sendHybridMessage(){
+  const from=document.getElementById('userId').value.trim(); const to=document.getElementById('recipientId').value.trim(); const plaintext=document.getElementById('plaintext').value;
+  if(!from||!to) return alert('ادخل from و to');
+  log('fetching recipient public key and verifying signature...');
+  const recipientJwk = await fetchPublicJwk(to);
+  log('recipient key ok:', recipientJwk);
+  const aesKey = await generateAesKey(); const exportedAes = await window.crypto.subtle.exportKey('raw', aesKey);
+  const { ivB64, ciphertextB64 } = await aesEncrypt(aesKey, plaintext);
+  const encryptedKeyB64 = await encryptAesKeyWithRsa(recipientJwk, exportedAes);
+  const resp = await fetch(serverUrlInput.value + '/send-message', { method:'POST', headers: Object.assign({'Content-Type':'application/json'}, authHeaders()), body: JSON.stringify({ from, to, encryptedKeyB64, ivB64, ciphertextB64 }) });
+  const j = await resp.json(); log('send:', j); if(j.ok) alert('تم الإرسال.');
+}
+document.getElementById('sendBtn').addEventListener('click', sendHybridMessage);
+
+// Fetch & decrypt messages
+async function decryptAesKeyWithMyPrivate(encryptedKeyB64){
+  if(!myKeyPair || !myKeyPair.privateKey) throw new Error('private key missing');
+  const encAB = b642ab(encryptedKeyB64);
+  const raw = await window.crypto.subtle.decrypt({ name:'RSA-OAEP' }, myKeyPair.privateKey, encAB); return raw;
+}
+async function importAesKeyFromRaw(raw){ return await window.crypto.subtle.importKey('raw', raw, { name:'AES-GCM' }, false, ['decrypt']); }
+async function aesDecrypt(aesKey, ivB64, ciphertextB64){ const iv = b642ab(ivB64); const ct = b642ab(ciphertextB64); const plain = await window.crypto.subtle.decrypt({ name:'AES-GCM', iv: new Uint8Array(iv) }, aesKey, ct); return ab2str(plain); }
+
+async function fetchAndDecryptMessages(){
+  const userId=document.getElementById('userId').value.trim();
+  if(!userId) return alert('ادخل userId');
+  const resp = await fetch(serverUrlInput.value + '/messages/' + encodeURIComponent(userId), { headers: authHeaders() });
+  const j = await resp.json(); log('fetched messages:', j);
+  const inbox = document.getElementById('inbox'); inbox.innerHTML = '';
+  for(const m of j.messages || []) {
+    let plain='(فشل)';
+    try {
+      const raw = await decryptAesKeyWithMyPrivate(m.encryptedKeyB64);
+      const aesKey = await importAesKeyFromRaw(raw);
+      plain = await aesDecrypt(aesKey, m.ivB64, m.ciphertextB64);
+    } catch(e){ plain='(فشل: '+e.message+')'; console.error(e); }
+    const d = new Date(m.ts||Date.now());
+    inbox.innerHTML += `<div style="border-bottom:1px solid #eee;padding:8px;margin-bottom:6px"><b>من:</b> ${m.from} <b>في:</b> ${d.toLocaleString()}<br/><b>النص:</b><div>${escapeHtml(plain)}</div></div>`;
+  }
+}
+document.getElementById('fetchBtn').addEventListener('click', fetchAndDecryptMessages);
+
+// utility conversions
+function b642ab(b64){ const binary = atob(b64); const len=binary.length; const bytes=new Uint8Array(len); for(let i=0;i<len;i++) bytes[i]=binary.charCodeAt(i); return bytes.buffer; }
+function ab2b64(buf){ const bytes=new Uint8Array(buf); let bin=''; for(let i=0;i<bytes.length;i++) bin+=String.fromCharCode(bytes[i]); return btoa(bin); }
+function escapeHtml(s){ if(!s) return ''; return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+
+// --- Export/Import private key (encrypted file) ---
+async function exportPrivateKeyEncrypted() {
+  if (!myKeyPair || !myKeyPair.privateKey) return alert('لا يوجد مفتاح خاص لتصديره. توليد أولاً.');
+  const pwd = document.getElementById('exportPassword').value || '';
+  // export private key as pkcs8
+  const pk8 = await window.crypto.subtle.exportKey('pkcs8', myKeyPair.privateKey); // ArrayBuffer
+  let payload = new Uint8Array(pk8);
+  // if password provided, derive key and encrypt with AES-GCM
+  let fileData;
+  if (pwd) {
+    const salt = window.crypto.getRandomValues(new Uint8Array(16));
+    const pwKey = await window.crypto.subtle.importKey('raw', new TextEncoder().encode(pwd), {name:'PBKDF2'}, false, ['deriveKey']);
+    const derived = await window.crypto.subtle.deriveKey({name:'PBKDF2', salt, iterations: 200000, hash:'SHA-256'}, pwKey, {name:'AES-GCM', length:256}, true, ['encrypt']);
+    const iv = window.crypto.getRandomValues(new Uint8Array(12));
+    const ct = await window.crypto.subtle.encrypt({name:'AES-GCM', iv}, derived, payload);
+    // store salt, iv, ciphertext
+    const blobParts = [salt.buffer, iv.buffer, ct];
+    fileData = new Blob(blobParts, {type: 'application/octet-stream'});
+  } else {
+    fileData = new Blob([payload.buffer], {type: 'application/octet-stream'});
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(fileData);
+  a.download = 'private_key.bin';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  alert('تم تنزيل الملف. احفظه في مكان آمن.');
+}
+
+async function importPrivateKeyEncrypted() {
+  const f = document.getElementById('importFile').files[0];
+  if (!f) return alert('اختر ملفاً');
+  const pwd = document.getElementById('importPassword').value || '';
+  const ab = await f.arrayBuffer();
+  let keyArrayBuffer;
+  if (pwd) {
+    // assume first 16 bytes salt, next 12 bytes iv, rest ciphertext
+    const view = new Uint8Array(ab);
+    const salt = view.slice(0,16).buffer;
+    const iv = view.slice(16,28).buffer;
+    const ct = view.slice(28).buffer;
+    const pwKey = await window.crypto.subtle.importKey('raw', new TextEncoder().encode(pwd), {name:'PBKDF2'}, false, ['deriveKey']);
+    const derived = await window.crypto.subtle.deriveKey({name:'PBKDF2', salt, iterations:200000, hash:'SHA-256'}, pwKey, {name:'AES-GCM', length:256}, true, ['decrypt']);
+    try {
+      keyArrayBuffer = await window.crypto.subtle.decrypt({name:'AES-GCM', iv: new Uint8Array(iv)}, derived, ct);
+    } catch (e) {
+      return alert('فشل فك التشفير — تأكد من كلمة السر.');
+    }
+  } else {
+    // raw pkcs8
+    keyArrayBuffer = ab;
+  }
+  try {
+    const privKey = await window.crypto.subtle.importKey('pkcs8', keyArrayBuffer, {name:'RSA-OAEP', hash:'SHA-256'}, true, ['decrypt']);
+    // attach to myKeyPair by keeping existing public and new private
+    if (!myKeyPair) myKeyPair = {};
+    myKeyPair.privateKey = privKey;
+    alert('تم استيراد المفتاح الخاص بنجاح.');
+  } catch (e) {
+    console.error(e);
+    alert('فشل استيراد المفتاح الخاص: ' + e.message);
+  }
+}
+
+document.getElementById('exportBtn').addEventListener('click', exportPrivateKeyEncrypted);
+document.getElementById('importBtn').addEventListener('click', importPrivateKeyEncrypted);
+// --- end export/import ---
+</script>
+</body>
+</html>
